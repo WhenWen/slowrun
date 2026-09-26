@@ -14,5 +14,7 @@ if [[ "$jobs" == *"$name"* ]]; then
 fi
 bash -n experiments/professor_forcing/run_marlowe.sh
 python -m py_compile train.py professor_forcing.py
-sbatch --job-name="$name" experiments/professor_forcing/run_marlowe.sh "$mode"
+extra=()
+if [[ "$mode" == smoke ]]; then extra+=(--time=00:30:00); fi
+sbatch --job-name="$name" "${extra[@]}" experiments/professor_forcing/run_marlowe.sh "$mode"
 squeue -u "$USER" -n "$name" -o '%.18i %.32j %.10P %.9T %.10M %.6D %R'
