@@ -14,7 +14,8 @@ export CUDA_VISIBLE_DEVICES=${TIGER_GPU_IDS:-0,1,2,3,4,5,6,7}
 export PATH="$PWD/.venv/bin:$PATH"
 export OMP_NUM_THREADS=1
 export NCCL_P2P_DISABLE=1
-export NCCL_SHM_DISABLE=1
+# P2P hangs across this node, but host shared memory passes eight-rank checks.
+export NCCL_SHM_DISABLE=0
 export NCCL_NET=Socket
 export TORCHINDUCTOR_COMPILE_THREADS=1
 export WANDB_MODE=offline

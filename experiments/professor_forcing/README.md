@@ -123,8 +123,12 @@ substitute for H100 timings in the final limited-track comparison.
 
 Tiger6 communication preflight: native NCCL succeeded on the adjacent GPU8/9 pair,
 but eight-GPU collectives timed out. Disabling SHM alone also timed out. The
-eight-GPU sum/barrier check passed with `NCCL_P2P_DISABLE=1`,
-`NCCL_SHM_DISABLE=1`, and `NCCL_NET=Socket`; these are set only in the Tiger runner.
+eight-GPU sum/barrier check initially passed with both P2P and SHM disabled,
+using socket transport. A later eight-rank test passed with P2P disabled and
+SHM enabled, including verified 256MiB all-reduce, reduce-scatter, and all-gather
+buffers. The Tiger runner now sets `NCCL_P2P_DISABLE=1`, `NCCL_SHM_DISABLE=0`,
+and `NCCL_NET=Socket`, allowing the faster host shared-memory path. These
+settings apply only to Tiger; collective timings alone are not training speedups.
 The original stalled training step was stopped before model creation; the user's
 holder allocation was preserved. GPU attention parity tests passed on A5000 for
 sequence lengths80/2048 and three causal window settings, with approximately0.3%
