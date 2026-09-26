@@ -13,6 +13,9 @@ flock -n 9 || { echo 'Another Tiger experiment is active in this checkout'; exit
 export CUDA_VISIBLE_DEVICES=${TIGER_GPU_IDS:-0,1,2,3,4,5,6,7}
 export PATH="$PWD/.venv/bin:$PATH"
 export OMP_NUM_THREADS=1
+export NCCL_P2P_DISABLE=1
+export NCCL_SHM_DISABLE=1
+export NCCL_NET=Socket
 export TORCHINDUCTOR_COMPILE_THREADS=1
 export WANDB_MODE=offline
 export PYTHONUNBUFFERED=1
@@ -30,6 +33,7 @@ hostname
 date -Is
 git rev-parse HEAD
 echo "EXPLORATORY_HARDWARE GPUs=$gpu_count run=$run_name holder=$SLURM_JOB_ID"
+echo "NCCL_P2P_DISABLE=$NCCL_P2P_DISABLE NCCL_SHM_DISABLE=$NCCL_SHM_DISABLE NCCL_NET=$NCCL_NET"
 nvidia-smi --query-gpu=index,name,memory.used --format=csv
 python -c 'from prepare_data import verify_hash; verify_hash("fineweb_data/fineweb_train.pt"); verify_hash("fineweb_data/fineweb_val.pt")'
 args=(--attention-backend fa2 --device-batch-size 1 --run-name "$run_name"

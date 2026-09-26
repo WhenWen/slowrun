@@ -89,3 +89,12 @@ lock to prevent overlapping experiments from the same checkout. Do not cancel th
 holder allocation when stopping an experiment. The model, data, and 11-epoch
 schedule stay the same; Ampere timings are exploratory measurements and cannot
 substitute for H100 timings in the final limited-track comparison.
+
+Tiger6 communication preflight: native NCCL succeeded on the adjacent GPU8/9 pair,
+but eight-GPU collectives timed out. Disabling SHM alone also timed out. The
+eight-GPU sum/barrier check passed with `NCCL_P2P_DISABLE=1`,
+`NCCL_SHM_DISABLE=1`, and `NCCL_NET=Socket`; these are set only in the Tiger runner.
+The original stalled training step was stopped before model creation; the user's
+holder allocation was preserved. GPU attention parity tests passed on A5000 for
+sequence lengths80/2048 and three causal window settings, with approximately0.3%
+gradient relative RMS error versus an FP32 reference.
