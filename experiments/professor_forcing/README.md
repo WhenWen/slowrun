@@ -72,6 +72,8 @@ PYTHONPATH=. python -m unittest discover -s tests -v
 bash experiments/professor_forcing/submit.sh smoke
 bash experiments/professor_forcing/submit.sh baseline
 bash experiments/professor_forcing/submit.sh pf
+# Optional sequential comparison on one physical node, only after smoke succeeds:
+bash experiments/professor_forcing/submit.sh pair <smoke-job-id>
 ```
 
 The runner selects the `preempt` partition, normal QoS, and the user's normal
@@ -79,6 +81,11 @@ project account. It submits exactly one node and eight GPUs. No automatic retry
 loop is enabled during bring-up. A killed/requeued attempt is not a completed
 comparison; start a fresh named attempt after diagnosis. Keep an interrupted
 attempt's logs and account for any suspension when judging wall-clock eligibility.
+Pair mode reserves three hours for two sequential, separately timed runs. It uses
+an `afterok` dependency on the user's smoke job and cancels if that dependency
+fails. Baseline failure stops the pair before PF starts. Both runs have separate
+result/checkpoint directories; sharing a node and compile cache is recorded when
+comparing wall time. The per-run training budget remains one hour.
 
 ## Tiger6 development
 

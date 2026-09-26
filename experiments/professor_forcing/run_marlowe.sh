@@ -16,8 +16,19 @@
 
 set -euo pipefail
 cd "${SLURM_SUBMIT_DIR:?}"
-mode=${1:?expected baseline, pf, or smoke}
-case "$mode" in baseline|pf|smoke) ;; *) exit 2 ;; esac
+mode=${1:?expected baseline, pf, smoke, or pair}
+case "$mode" in
+    pair)
+        # Separate trainers/seeds/results, one physical node and shared compile cache.
+        # Stop the comparison if either trainer fails; never retry automatically.
+        bash "$0" baseline
+        bash "$0" pf
+        echo "SLOWRUN_PAIR_COMPLETED job=$SLURM_JOB_ID"
+        exit 0
+        ;;
+    baseline|pf|smoke) ;;
+    *) exit 2 ;;
+esac
 run_name="pf-${mode}-${SLURM_JOB_ID}"
 export PATH="$PWD/.venv/bin:$PATH"
 export OMP_NUM_THREADS=1
