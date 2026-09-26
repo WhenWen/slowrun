@@ -24,9 +24,12 @@ export OMP_NUM_THREADS=1
 export WANDB_MODE=offline
 export PYTHONUNBUFFERED=1
 export TIKTOKEN_CACHE_DIR="$PWD/.cache/tiktoken"
+export HF_HOME="$PWD/.cache/huggingface"
+export XDG_CACHE_HOME="$PWD/.cache"
+export CUDA_CACHE_PATH="/tmp/slowrun-${USER}-${SLURM_JOB_ID}/cuda"
 export TORCHINDUCTOR_CACHE_DIR="/tmp/slowrun-${USER}-${SLURM_JOB_ID}/inductor"
 export TRITON_CACHE_DIR="/tmp/slowrun-${USER}-${SLURM_JOB_ID}/triton"
-mkdir -p "$TIKTOKEN_CACHE_DIR" "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR" "runs/$run_name"
+mkdir -p "$TIKTOKEN_CACHE_DIR" "$HF_HOME" "$CUDA_CACHE_PATH" "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR" "runs/$run_name"
 hostname
 date -Is
 nvidia-smi --query-gpu=name,memory.total --format=csv
