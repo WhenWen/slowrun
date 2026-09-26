@@ -47,10 +47,18 @@ empirical question; short rollouts may be too weak, or overhead may erase the ga
    every exploratory run separately; do not hide extra work inside a submitted run.
 
 The script logs both upstream-style training time (which omits warmup steps) and
-full script wall time including compilation and evaluation. A run over one hour
-cannot be presented as a compliant record based on the smaller timing number.
+full script wall time including compilation and evaluation. The accepted
+[current record, PR98](https://github.com/qlabs-eng/slowrun/pull/98), explicitly
+reports training time: its submitted seed43
+[log](https://gist.github.com/dangxingyu/c1c6754312714772b2927b8c6ca0c874)
+(`sub-1h-minimal-v2-s43-rerun.train.log`) records 59.28 minutes of training and
+71.10 minutes of total wall time. Compare using this demonstrated convention,
+while always disclosing both numbers and any changes to warmup accounting.
+Our first PF update at step192 currently includes PF compilation in the training
+timer; the isolated replay diagnostic does not remove that cost from a run.
 The two-hour SLURM allocation allows diagnosis/measurement; it does not expand
-the track budget. Smoke results are explicitly labeled and are not benchmark results.
+the one-hour training budget. Smoke results are explicitly labeled and are not
+benchmark results.
 
 ## Marlowe
 
