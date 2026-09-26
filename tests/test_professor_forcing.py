@@ -1,0 +1,121 @@
+"""CPU correctness tests; the real eight-GPU run is validated separately."""
+import ast
+from pathlib import Path
+import sys
+import types
+import unittest
+
+import torch
+from torch import nn
+from torch.nn import functional as F
+
+from professor_forcing import ProfessorForcing, sample_continuation
+
+
+class ToyLM(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embedding = nn.Embedding(13, 8)
+        self.head = nn.Linear(8, 13)
+        self.seen = []
+
+    def forward(self, tokens, return_hidden=False, logit_positions=None):
+        self.seen.append(tokens.detach().clone())
+        hidden = self.embedding(tokens).cumsum(1)
+        if return_hidden:
+            return hidden
+        if logit_positions is not None:
+            hidden = hidden.index_select(1, logit_positions)
+        return self.head(hidden)
+
+
+def load_gpt_definitions():
+    # train.py is an executable script. Load its definitions without its training
+    # side effects; retain the actual model code rather than duplicating it.
+    source = Path(__file__).resolve().parents[1].joinpath('train.py').read_text()
+    prefix = source.split('# Compute init\n')[0]
+    module = types.ModuleType('slowrun_test_defs')
+    sys.modules[module.__name__] = module
+    old_argv = sys.argv
+    try:
+        sys.argv = ['train.py', '--mtp-weight', '0']
+        exec(compile(ast.parse(prefix), 'train.py', 'exec'), module.__dict__)
+    finally:
+        sys.argv = old_argv
+    def attention(q, k, v, causal=False, window_size=(-1, -1)):
+        t = q.size(1)
+        i = torch.arange(t)
+        mask = i[:, None] >= i[None, :]
+        if window_size[0] >= 0:
+            mask &= i[:, None] - i[None, :] <= window_size[0]
+        return F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2),
+                                              v.transpose(1, 2), attn_mask=mask).transpose(1, 2)
+    module.flash_attn.flash_attn_func = attention
+    return module
+
+
+class ProfessorForcingTests(unittest.TestCase):
+    def setUp(self):
+        torch.manual_seed(42)
+        torch.set_num_threads(1)
+
+    def test_rollout_conditions_on_previous_samples(self):
+        model = ToyLM().eval()
+        prompt = torch.tensor([[2, 3], [4, 5]])
+        result = sample_continuation(model, prompt, 4, torch.Generator().manual_seed(9))
+        self.assertTrue(torch.equal(result[:, :2], prompt))
+        self.assertEqual(result.shape, (2, 6))
+        for t, seen in enumerate(model.seen):
+            self.assertTrue(torch.equal(seen[:, :2+t], result[:, :2+t]))
+        self.assertFalse(result.requires_grad)
+
+    def test_discriminator_cannot_backprop_into_generator_when_gated(self):
+        model = ToyLM().train()
+        pf = ProfessorForcing(8, torch.device('cpu'), context=2, rollout=4,
+                              generator_min_accuracy=1.0)
+        before = [p.clone() for p in pf.discriminator.parameters()]
+        pf.backward(model, torch.randint(13, (4, 6)), 0.02)
+        self.assertTrue(all(p.grad is None for p in model.parameters()))
+        self.assertTrue(any(not torch.equal(a, b) for a, b in zip(before, pf.discriminator.parameters())))
+        self.assertTrue(model.training)
+
+    def test_generator_gradient_and_rng_isolation(self):
+        model = ToyLM().train()
+        rng = torch.get_rng_state().clone()
+        pf = ProfessorForcing(8, torch.device('cpu'), context=2, rollout=4,
+                              generator_min_accuracy=-1)
+        self.assertTrue(torch.equal(rng, torch.get_rng_state()))
+        tokens = torch.randint(13, (4, 6))
+        rng = torch.get_rng_state().clone()
+        result = pf.backward(model, tokens, 0.02)
+        self.assertTrue(torch.equal(rng, torch.get_rng_state()))
+        self.assertEqual(result['pf_g_enabled'], 1)
+        self.assertGreater(model.embedding.weight.grad.norm().item(), 0)
+        self.assertIsNone(model.head.weight.grad)  # discrete samples are detached
+        self.assertTrue(all(p.grad is None for p in pf.discriminator.parameters()))
+        self.assertTrue(model.training)
+
+    def test_actual_gpt_causality_and_behavior_replay(self):
+        m = load_gpt_definitions()
+        cfg = m.GPTConfig(sequence_len=16, vocab_size=13, n_layer=4, n_head=2,
+                          n_kv_head=2, n_embd=32, dropout=0, stoch_depth=0, use_iha=True)
+        model = m.GPT(cfg)
+        model.init_weights()
+        model.eval()
+        tokens = torch.randint(13, (2, 10))
+        full = model(tokens)
+        pos = torch.tensor([4])
+        torch.testing.assert_close(model(tokens, logit_positions=pos), full[:, 4:5])
+        torch.testing.assert_close(model(tokens[:, :5])[:, -1:], full[:, 4:5])
+        changed = tokens.clone()
+        changed[:, 5:] = 0
+        torch.testing.assert_close(model(changed)[:, :5], full[:, :5])
+        pf = ProfessorForcing(32, torch.device('cpu'), context=4, rollout=4,
+                              generator_min_accuracy=-1)
+        pf.backward(model, tokens, 0.02)
+        self.assertGreater(model.transformer.h[0].attn.c_q.weight.grad.norm().item(), 0)
+        self.assertFalse(model.training)
+
+
+if __name__ == '__main__':
+    unittest.main()

@@ -99,7 +99,17 @@ parser.add_argument("--mg-step-norm", type=float, default=0.5, help="L2 norm of 
 parser.add_argument("--mg-step-schedule", type=str, default="lr", choices=["const", "lr"],
                     help="lr: scale the step norm by the warmdown learning-rate multiplier")
 parser.add_argument("--mg-plastic", type=str, default="matrix_all", choices=["matrix_all", "mlp_all"])
+parser.add_argument("--pf-weight", type=float, default=0.0, help="Professor Forcing generator weight (0=off)")
+parser.add_argument("--pf-every", type=int, default=8)
+parser.add_argument("--pf-start-step", type=int, default=192)
+parser.add_argument("--pf-context", type=int, default=64)
+parser.add_argument("--pf-rollout", type=int, default=16)
+parser.add_argument("--pf-batch", type=int, default=4)
+parser.add_argument("--pf-min-accuracy", type=float, default=0.75)
+parser.add_argument("--max-steps", type=int, default=0, help="Smoke: stop after N steps, preserving the full LR schedule")
 args = parser.parse_args()
+if args.pf_weight < 0 or args.pf_every < 1 or args.pf_start_step < 0:
+    parser.error("Invalid Professor Forcing weight, frequency, or start step")
 
 # Resolve output path
 if args.output_json and not args.save_result:
@@ -531,7 +541,7 @@ class GPT(nn.Module):
             x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i])
         return x
 
-    def forward(self, idx, targets=None, loss_reduction='mean'):
+    def forward(self, idx, targets=None, loss_reduction='mean', return_hidden=False, logit_positions=None):
         B, T = idx.size()
         x = norm(self.transformer.wte(idx))
         x0 = x
@@ -563,6 +573,10 @@ class GPT(nn.Module):
                                         dupe[1], self.config.n_layer, T)
 
         x = norm(x)
+        if return_hidden:
+            return x
+        if logit_positions is not None:
+            x = x.index_select(1, logit_positions)
         logits = self.lm_head(x)[..., :self.config.vocab_size].float()
         logits = LOGIT_CAP * torch.tanh(logits / LOGIT_CAP) if LOGIT_CAP > 0 else logits
         if targets is None:
@@ -1068,6 +1082,12 @@ model = torch.compile(model, dynamic=False)
 
 # Optimizer
 optimizer = model.setup_optimizer()
+pf = None
+if args.pf_weight > 0:
+    from professor_forcing import ProfessorForcing
+    pf = ProfessorForcing(N_EMBD, device, context=args.pf_context, rollout=args.pf_rollout,
+                         batch=args.pf_batch, generator_min_accuracy=args.pf_min_accuracy)
+    print0(f"Professor Forcing: {vars(args)}")
 
 # ---- every-step meta-gradient step ----
 MG = args.mg_every > 0
@@ -1197,6 +1217,10 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
     # Training step
     synchronize()
     t0 = time.time()
+    pf_metrics = {}
+    if pf is not None and step >= args.pf_start_step and step % args.pf_every == 0:
+        with autocast_ctx:
+            pf_metrics = pf.backward(model, x, args.pf_weight)
     if MG and step % args.mg_every == 0 and grad_accum_steps >= 2:
         # split pairing: the first half of this step's micro-batches adapts, the second half is
         # evaluated at the adapted point; the optimizer receives the ordinary full-batch mean gradient
@@ -1260,6 +1284,10 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
     print0(f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}%{dupe_str}{eta_str}")
     wandb_run.log({"step": step, "train/loss": debiased, "train/mfu": mfu,
                    **{f"train/{k}": v.item() for k, v in metrics.items()}})
+    if pf_metrics:
+        pf_metrics = {k: v.item() if isinstance(v, Tensor) else v for k, v in pf_metrics.items()}
+        print0(f"Professor Forcing step {step}: {json.dumps(pf_metrics)}")
+        wandb_run.log({"step": step, **pf_metrics})
 
     # Synchronize epoch across ranks (different ranks may exhaust data at different steps)
     if ddp:
@@ -1309,6 +1337,9 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
     # GC management
     if step == 1:
         gc.collect(); gc.freeze(); gc.disable()
+    if args.max_steps and step >= args.max_steps:
+        print0(f"Smoke stop at step {step}; this is not a completed benchmark run")
+        break
 
 # =============================================================================
 # Post-training: evaluate checkpoint averages
@@ -1374,6 +1405,11 @@ if master_process:
         "val_loss": val_loss,
         "best_val_loss": min_val_loss,
         "wandb_url": getattr(wandb_run, "url", None),
+        "args": vars(args),
+        "steps": step,
+        "smoke": bool(args.max_steps),
+        "training_seconds_excluding_warmup": total_training_time,
+        "wall_seconds_including_compile_eval": time.time() - _script_start,
     }
     with open(_result_out, "w") as f:
         json.dump(result, f, indent=2)

@@ -5,3 +5,7 @@ logit_avg_ckpts/
 tiny_ckpts/
 runs/
 __pycache__/
+.venv/
+.cache/
+setup.log
+prepare.log
