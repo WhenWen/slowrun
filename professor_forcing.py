@@ -68,6 +68,15 @@ class ProfessorForcing:
         Called before ordinary microbatches, so the combined objective participates
         in the existing meta-gradient adaptation just like the CE/MTP objective.
         """
+        # Sampling uses no_grad and D changes both weights and requires_grad.
+        # Cached autocast weight casts would otherwise silently detach the replay
+        # gradient or reuse D's pre-update weights within the enclosing context.
+        device_type = tokens.device.type
+        with torch.autocast(device_type, enabled=torch.is_autocast_enabled(device_type),
+                            dtype=torch.get_autocast_dtype(device_type), cache_enabled=False):
+            return self._backward(model, tokens, weight)
+
+    def _backward(self, model, tokens, weight):
         p, r = self.context, self.rollout
         if tokens.size(1) < p + r:
             raise ValueError("PF context + rollout exceeds training sequence length")

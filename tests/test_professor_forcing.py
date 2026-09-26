@@ -116,6 +116,30 @@ class ProfessorForcingTests(unittest.TestCase):
         self.assertGreater(model.transformer.h[0].attn.c_q.weight.grad.norm().item(), 0)
         self.assertFalse(model.training)
 
+    def test_bf16_replay_does_not_reuse_detached_autocast_weights(self):
+        m = load_gpt_definitions()
+        cfg = m.GPTConfig(sequence_len=16, vocab_size=13, n_layer=4, n_head=2,
+                          n_kv_head=2, n_embd=32, dropout=.05, stoch_depth=0, use_iha=True)
+        model = m.GPT(cfg)
+        model.init_weights()
+        pf = ProfessorForcing(32, torch.device('cpu'), context=4, rollout=4,
+                              generator_min_accuracy=-1)
+        x, y = torch.randint(13, (4, 16)), torch.randint(13, (4, 16))
+        for _ in range(2):
+            with torch.autocast('cpu', dtype=torch.bfloat16):
+                pf.backward(model, x, .02)
+                # All trunk matrices must receive the hidden-state gradient;
+                # no-gradient sampling must not poison autocast's weight cache.
+                for name, param in model.transformer.h.named_parameters():
+                    self.assertIsNotNone(param.grad, name)
+                    self.assertTrue(torch.isfinite(param.grad).all(), name)
+                loss, _ = model(x, y)
+            loss.backward()
+            for name, param in model.named_parameters():
+                self.assertIsNotNone(param.grad, name)
+                self.assertTrue(torch.isfinite(param.grad).all(), name)
+            model.zero_grad(set_to_none=True)
+
 
 if __name__ == '__main__':
     unittest.main()
