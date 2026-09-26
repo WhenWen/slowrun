@@ -4,10 +4,14 @@ from pathlib import Path
 import sys
 import types
 import unittest
+import tempfile
+from datetime import timedelta
 
 import torch
 from torch import nn
 from torch.nn import functional as F
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
 from professor_forcing import ProfessorForcing, sample_continuation
 
@@ -54,6 +58,33 @@ def load_gpt_definitions():
     return module
 
 
+def distributed_pf_worker(rank, rendezvous):
+    torch.set_num_threads(1)
+    dist.init_process_group('gloo', init_method='file://' + rendezvous,
+                            rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        # Deliberately distinct local data/model behavior must still produce one
+        # identical discriminator update and a common gate decision on both ranks.
+        torch.manual_seed(100 + rank)
+        model = ToyLM()
+        pf = ProfessorForcing(8, torch.device('cpu'), context=2, rollout=4,
+                              generator_min_accuracy=-1)
+        for _ in range(2):
+            metrics = pf.backward(model, torch.randint(13, (4, 6)), .02)
+            flat = torch.cat([p.detach().flatten() for p in pf.discriminator.parameters()])
+            gathered = [torch.empty_like(flat) for _ in range(2)]
+            dist.all_gather(gathered, flat)
+            torch.testing.assert_close(gathered[0], gathered[1], rtol=0, atol=0)
+            accs = [torch.zeros_like(metrics['pf_accuracy']) for _ in range(2)]
+            dist.all_gather(accs, metrics['pf_accuracy'])
+            torch.testing.assert_close(accs[0], accs[1], rtol=0, atol=0)
+            assert metrics['pf_g_enabled'] == 1
+            assert model.embedding.weight.grad.norm() > 0
+            model.zero_grad(set_to_none=True)
+    finally:
+        dist.destroy_process_group()
+
+
 class ProfessorForcingTests(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(42)
@@ -68,6 +99,11 @@ class ProfessorForcingTests(unittest.TestCase):
         for t, seen in enumerate(model.seen):
             self.assertTrue(torch.equal(seen[:, :2+t], result[:, :2+t]))
         self.assertFalse(result.requires_grad)
+
+    def test_two_rank_discriminator_and_gate_synchronization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            mp.spawn(distributed_pf_worker, args=(str(Path(directory) / 'rendezvous'),),
+                     nprocs=2, join=True)
 
     def test_discriminator_cannot_backprop_into_generator_when_gated(self):
         model = ToyLM().train()

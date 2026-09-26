@@ -1179,6 +1179,9 @@ epochs_without_improvement = 0
 smooth_train_loss = 0
 total_training_time = 0
 timed_steps = 0
+pf_updates = 0
+pf_generator_updates = 0
+pf_seconds = 0.0
 timing_start_step = 4  # skip first compile + 3 warmup steps
 eval_steps = EVAL_TOKENS // (args.device_batch_size * MAX_SEQ_LEN * ddp_world_size)
 dupe_active = False
@@ -1219,8 +1222,15 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
     t0 = time.time()
     pf_metrics = {}
     if pf is not None and step >= args.pf_start_step and step % args.pf_every == 0:
+        pf_t0 = time.perf_counter()
         with autocast_ctx:
             pf_metrics = pf.backward(model, x, args.pf_weight)
+        synchronize()
+        pf_dt = time.perf_counter() - pf_t0
+        pf_seconds += pf_dt
+        pf_updates += 1
+        pf_generator_updates += int(pf_metrics["pf_g_enabled"])
+        pf_metrics["pf_seconds"] = pf_dt
     if MG and step % args.mg_every == 0 and grad_accum_steps >= 2:
         # split pairing: the first half of this step's micro-batches adapts, the second half is
         # evaluated at the adapted point; the optimizer receives the ordinary full-batch mean gradient
@@ -1339,6 +1349,8 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
         gc.collect(); gc.freeze(); gc.disable()
     if args.max_steps and step >= args.max_steps:
         print0(f"Smoke stop at step {step}; this is not a completed benchmark run")
+        if pf is not None and pf_generator_updates == 0:
+            print0("PF generator gate never opened: this smoke has NOT validated the generator replay backward path")
         break
 
 # =============================================================================
@@ -1410,6 +1422,9 @@ if master_process:
         "smoke": bool(args.max_steps),
         "training_seconds_excluding_warmup": total_training_time,
         "wall_seconds_including_compile_eval": time.time() - _script_start,
+        "pf_updates": pf_updates,
+        "pf_generator_updates": pf_generator_updates,
+        "pf_seconds_including_compile": pf_seconds,
     }
     with open(_result_out, "w") as f:
         json.dump(result, f, indent=2)
