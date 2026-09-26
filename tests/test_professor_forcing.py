@@ -1,5 +1,7 @@
 """CPU correctness tests; the real eight-GPU run is validated separately."""
 import ast
+import copy
+from dataclasses import replace
 from pathlib import Path
 import sys
 import types
@@ -33,7 +35,7 @@ class ToyLM(nn.Module):
         return self.head(hidden)
 
 
-def load_gpt_definitions():
+def load_gpt_definitions(mtp_weight=0):
     # train.py is an executable script. Load its definitions without its training
     # side effects; retain the actual model code rather than duplicating it.
     source = Path(__file__).resolve().parents[1].joinpath('train.py').read_text()
@@ -42,7 +44,7 @@ def load_gpt_definitions():
     sys.modules[module.__name__] = module
     old_argv = sys.argv
     try:
-        sys.argv = ['train.py', '--mtp-weight', '0']
+        sys.argv = ['train.py', '--mtp-weight', str(mtp_weight)]
         exec(compile(ast.parse(prefix), 'train.py', 'exec'), module.__dict__)
     finally:
         sys.argv = old_argv
@@ -175,6 +177,44 @@ class ProfessorForcingTests(unittest.TestCase):
                 self.assertIsNotNone(param.grad, name)
                 self.assertTrue(torch.isfinite(param.grad).all(), name)
             model.zero_grad(set_to_none=True)
+
+    def test_checkpointing_preserves_mtp_dropout_gradients_and_pf_replay(self):
+        m = load_gpt_definitions(mtp_weight=.3)
+        cfg = m.GPTConfig(sequence_len=16, vocab_size=13, n_layer=4, n_head=2,
+                          n_kv_head=2, n_embd=32, dropout=.1, stoch_depth=.2,
+                          use_iha=True)
+        reference = m.GPT(cfg)
+        reference.init_weights()
+        checkpointed = copy.deepcopy(reference)
+        checkpointed.config = replace(cfg, activation_checkpointing=True)
+        x, y = torch.randint(13, (2, 16)), torch.randint(13, (2, 16))
+        for dupe in (False, True):
+            if dupe:
+                reference.set_dupe_layers(2, 3, 2)
+                checkpointed.set_dupe_layers(2, 3, 2)
+            outcomes = []
+            for model in (reference, checkpointed):
+                model.zero_grad(set_to_none=True)
+                torch.manual_seed(177)
+                with torch.autocast('cpu', dtype=torch.bfloat16):
+                    loss, _ = model(x, y)
+                loss.backward()
+                outcomes.append((loss.detach(), torch.get_rng_state().clone()))
+            torch.testing.assert_close(outcomes[0][0], outcomes[1][0])
+            self.assertTrue(torch.equal(outcomes[0][1], outcomes[1][1]))
+            for (name, expected), (_, actual) in zip(reference.named_parameters(),
+                                                     checkpointed.named_parameters()):
+                self.assertIsNotNone(expected.grad, name)
+                self.assertIsNotNone(actual.grad, name)
+                torch.testing.assert_close(actual.grad, expected.grad, msg=name)
+        checkpointed.zero_grad(set_to_none=True)
+        pf = ProfessorForcing(32, torch.device('cpu'), context=4, rollout=4,
+                              generator_min_accuracy=-1)
+        with torch.autocast('cpu', dtype=torch.bfloat16):
+            pf.backward(checkpointed, x, .02)
+        for name, param in checkpointed.transformer.h.named_parameters():
+            self.assertIsNotNone(param.grad, name)
+            self.assertTrue(torch.isfinite(param.grad).all(), name)
 
 
 if __name__ == '__main__':

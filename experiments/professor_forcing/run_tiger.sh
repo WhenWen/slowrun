@@ -36,7 +36,7 @@ echo "EXPLORATORY_HARDWARE GPUs=$gpu_count run=$run_name holder=$SLURM_JOB_ID"
 echo "NCCL_P2P_DISABLE=$NCCL_P2P_DISABLE NCCL_SHM_DISABLE=$NCCL_SHM_DISABLE NCCL_NET=$NCCL_NET"
 nvidia-smi --query-gpu=index,name,memory.used --format=csv
 python -c 'from prepare_data import verify_hash; verify_hash("fineweb_data/fineweb_train.pt"); verify_hash("fineweb_data/fineweb_val.pt")'
-args=(--attention-backend fa2 --device-batch-size 1 --run-name "$run_name"
+args=(--attention-backend fa2 --activation-checkpointing --device-batch-size 1 --run-name "$run_name"
       --logit-avg-dir "runs/$run_name/ensemble")
 if [[ "$mode" != baseline ]]; then args+=(--pf-weight 0.02); fi
 if [[ "$mode" == smoke ]]; then args+=(--max-steps "${TIGER_MAX_STEPS:-224}"); fi

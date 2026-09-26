@@ -27,6 +27,7 @@ torch._dynamo.config.cache_size_limit = 64
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
+from torch.utils.checkpoint import checkpoint
 from torch import Tensor
 import wandb
 import tiktoken
@@ -109,6 +110,8 @@ parser.add_argument("--pf-min-accuracy", type=float, default=0.75)
 parser.add_argument("--max-steps", type=int, default=0, help="Smoke: stop after N steps, preserving the full LR schedule")
 parser.add_argument("--attention-backend", choices=["fa3", "fa2"], default="fa3",
                     help="FA3 for Hopper benchmark; FA2 permits exploratory runs on Ampere")
+parser.add_argument("--activation-checkpointing", action="store_true",
+                    help="Recompute block activations to fit exploratory GPUs with less memory")
 args = parser.parse_args()
 if args.pf_weight < 0 or args.pf_every < 1 or args.pf_start_step < 0:
     parser.error("Invalid Professor Forcing weight, frequency, or start step")
@@ -252,6 +255,7 @@ class GPTConfig:
     stoch_depth: float = 0.05
     use_iha: bool = False
     iha_mix_v: bool = True
+    activation_checkpointing: bool = False
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
@@ -532,6 +536,12 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
+    def _run_block(self, block, x, ve, cos_sin, window_size):
+        if self.config.activation_checkpointing and torch.is_grad_enabled():
+            return checkpoint(block, x, ve, cos_sin, window_size,
+                              use_reentrant=False, preserve_rng_state=True)
+        return block(x, ve, cos_sin, window_size)
+
     def _run_decoder_layers(self, x, x0, encoder_outputs, start, end, T):
         """Run decoder layers [start, end), with U-Net skip connections."""
         cos_sin = (self.cos[:, :T], self.sin[:, :T])
@@ -542,7 +552,7 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i - self.encoder_layers] * encoder_outputs[j]
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
-            x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i])
+            x = self._run_block(self.transformer.h[i], x, ve, cos_sin, self.window_sizes[i])
         return x
 
     def forward(self, idx, targets=None, loss_reduction='mean', return_hidden=False, logit_positions=None):
@@ -556,7 +566,7 @@ class GPT(nn.Module):
         for i in range(self.encoder_layers):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
-            x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i])
+            x = self._run_block(self.transformer.h[i], x, ve, cos_sin, self.window_sizes[i])
             encoder_outputs.append(x)
 
         # Decoder half
@@ -594,7 +604,8 @@ class GPT(nn.Module):
         mtp_emb = norm(self.transformer.wte(targets[:, :-1].clamp(min=0)))
         combined = self.mtp_proj(torch.cat([x[:, :-1], mtp_emb], dim=-1))
         mT = combined.size(1)
-        mtp_out = norm(self.mtp_block(combined, None, (self.cos[:, :mT], self.sin[:, :mT]), (-1, -1)))
+        mtp_out = norm(self._run_block(self.mtp_block, combined, None,
+                                      (self.cos[:, :mT], self.sin[:, :mT]), (-1, -1)))
         mtp_logits = self.lm_head(mtp_out)[..., :self.config.vocab_size].float()
         if LOGIT_CAP > 0:
             mtp_logits = LOGIT_CAP * torch.tanh(mtp_logits / LOGIT_CAP)
@@ -1066,7 +1077,8 @@ token_bytes = torch.tensor(token_bytes_list, dtype=torch.int32, device=device)
 # Build model
 config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout,
                    stoch_depth=args.stoch_depth,
-                   use_iha=args.iha, iha_mix_v=args.iha)
+                   use_iha=args.iha, iha_mix_v=args.iha,
+                   activation_checkpointing=args.activation_checkpointing)
 with torch.device("meta"):
     model = GPT(config)
 model.to_empty(device=device)

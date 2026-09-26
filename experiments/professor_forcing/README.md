@@ -93,7 +93,12 @@ Tiger6 has RTX A5000 24GB GPUs (Ampere), which cannot run the Hopper FA3 kernel.
 `--attention-backend fa2` explicitly selects the pinned major-version-3 Hugging Face
 FlashAttention-2 kernel; the default Hopper path remains FA3 version 1.
 `run_tiger.sh` uses the full root model and total batch with a device batch of 1,
-adjusting accumulation through the existing trainer. GPU memory must be checked
+adjusting accumulation through the existing trainer. It enables non-reentrant
+activation checkpointing for transformer and MTP blocks, preserving dropout RNG.
+The uncheckpointed four-step test passed but the longer run exhausted GPU memory
+after step38, before PF activated; short-run success did not establish sustained
+memory headroom. Checkpointing trades recomputation for memory and is disabled
+by default on the H100 path. GPU memory must be checked
 on the actual run. It accepts 1/2/4/8 GPUs via `TIGER_GPU_IDS` and records GPU type
 and world size in results. Start with `TIGER_MAX_STEPS=4` for memory/optimizer
 bring-up, then extend the same configuration to 224 steps to reach PF updates.
@@ -108,6 +113,7 @@ checks two compiled BF16 replay backward passes for finite trunk gradients and
 gradient isolation. It does not run the training optimizer or establish memory
 headroom alongside the training graph. The normal 224-step smoke retains the
 paper's accuracy gate and is still required.
+Add `--activation-checkpointing` to the diagnostic to exercise the Tiger setting.
 
 Run as an `srun` step within an existing authorized allocation. The script uses a
 lock to prevent overlapping experiments from the same checkout. Do not cancel the

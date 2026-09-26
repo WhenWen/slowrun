@@ -20,6 +20,7 @@ from professor_forcing import ProfessorForcing
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--backend', choices=['fa2', 'fa3'], required=True)
+    parser.add_argument('--activation-checkpointing', action='store_true')
     args = parser.parse_args()
     source = Path(__file__).resolve().parents[1].joinpath('train.py').read_text()
     module = types.ModuleType('slowrun_gpu_diagnostic')
@@ -35,7 +36,8 @@ def main():
     device = torch.device('cuda', 0)
     torch.manual_seed(42)
     config = module.GPTConfig(vocab_size=50257, dropout=.05,
-                             use_iha=True, iha_mix_v=True)
+                             use_iha=True, iha_mix_v=True,
+                             activation_checkpointing=args.activation_checkpointing)
     with torch.device('meta'):
         original = module.GPT(config)
     original.to_empty(device=device)
@@ -46,6 +48,7 @@ def main():
     tokens = torch.randint(50257, (1, 80), device=device)
     print(json.dumps({'phase': 'model_ready',
                       'parameters': sum(p.numel() for p in original.parameters()),
+                      'activation_checkpointing': args.activation_checkpointing,
                       'forced_generator_gate': True}), flush=True)
     for iteration in range(2):
         start = time.perf_counter()
