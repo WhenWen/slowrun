@@ -218,7 +218,7 @@ def _load_flash_attention():
         os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
         from kernels import get_kernel
         if args.attention_backend == "fa2":
-            return get_kernel('kernels-community/flash-attn2', version=2)
+            return get_kernel('kernels-community/flash-attn2', version=3)
         return get_kernel('kernels-community/flash-attn3', version=1)
     except ImportError:
         print0("Warning: kernels package not found. Install with: pip install -U kernels")

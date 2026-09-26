@@ -75,7 +75,7 @@ attempt's logs and account for any suspension when judging wall-clock eligibilit
 ## Tiger6 development
 
 Tiger6 has RTX A5000 24GB GPUs (Ampere), which cannot run the Hopper FA3 kernel.
-`--attention-backend fa2` explicitly selects the pinned major-version-2 Hugging Face
+`--attention-backend fa2` explicitly selects the pinned major-version-3 Hugging Face
 FlashAttention-2 kernel; the default Hopper path remains FA3 version 1.
 `run_tiger.sh` uses the full root model and total batch with a device batch of 1,
 adjusting accumulation through the existing trainer. GPU memory must be checked
