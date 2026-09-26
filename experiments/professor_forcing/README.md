@@ -71,3 +71,21 @@ project account. It submits exactly one node and eight GPUs. No automatic retry
 loop is enabled during bring-up. A killed/requeued attempt is not a completed
 comparison; start a fresh named attempt after diagnosis. Keep an interrupted
 attempt's logs and account for any suspension when judging wall-clock eligibility.
+
+## Tiger6 development
+
+Tiger6 has RTX A5000 24GB GPUs (Ampere), which cannot run the Hopper FA3 kernel.
+`--attention-backend fa2` explicitly selects the pinned major-version-2 Hugging Face
+FlashAttention-2 kernel; the default Hopper path remains FA3 version 1.
+`run_tiger.sh` uses the full root model and total batch with a device batch of 1,
+adjusting accumulation through the existing trainer. GPU memory must be checked
+on the actual run. It accepts 1/2/4/8 GPUs via `TIGER_GPU_IDS` and records GPU type
+and world size in results. Start with `TIGER_MAX_STEPS=4` for memory/optimizer
+bring-up, then extend the same configuration to 224 steps to reach PF updates.
+Neither prefix is a completed performance comparison.
+
+Run as an `srun` step within an existing authorized allocation. The script uses a
+lock to prevent overlapping experiments from the same checkout. Do not cancel the
+holder allocation when stopping an experiment. The model, data, and 11-epoch
+schedule stay the same; Ampere timings are exploratory measurements and cannot
+substitute for H100 timings in the final limited-track comparison.

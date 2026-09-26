@@ -107,6 +107,8 @@ parser.add_argument("--pf-rollout", type=int, default=16)
 parser.add_argument("--pf-batch", type=int, default=4)
 parser.add_argument("--pf-min-accuracy", type=float, default=0.75)
 parser.add_argument("--max-steps", type=int, default=0, help="Smoke: stop after N steps, preserving the full LR schedule")
+parser.add_argument("--attention-backend", choices=["fa3", "fa2"], default="fa3",
+                    help="FA3 for Hopper benchmark; FA2 permits exploratory runs on Ampere")
 args = parser.parse_args()
 if args.pf_weight < 0 or args.pf_every < 1 or args.pf_start_step < 0:
     parser.error("Invalid Professor Forcing weight, frequency, or start step")
@@ -206,27 +208,29 @@ def load_state_dict_into_model(model, state_dict):
 # Flash Attention (FA3 on Hopper)
 # =============================================================================
 
-def _load_fa3():
+def _load_flash_attention():
     if not torch.cuda.is_available():
         return None
     try:
         major, _ = torch.cuda.get_device_capability()
-        if major != 9:
+        if args.attention_backend == "fa3" and major != 9:
             return None
         os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
         from kernels import get_kernel
+        if args.attention_backend == "fa2":
+            return get_kernel('kernels-community/flash-attn2', version=2)
         return get_kernel('kernels-community/flash-attn3', version=1)
     except ImportError:
         print0("Warning: kernels package not found. Install with: pip install -U kernels")
         return None
     except Exception as e:
-        print0(f"Warning: Failed to load FA3 kernel: {e}")
+        print0(f"Warning: Failed to load {args.attention_backend} kernel: {e}")
         return None
 
-_fa3 = _load_fa3()
+_fa3 = _load_flash_attention()
 
 def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
-    """Flash Attention for training (FA3 only). q,k,v: (B, T, H, D)."""
+    """Selected Flash Attention kernel. q,k,v: (B, T, H, D)."""
     return _fa3.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
 
 flash_attn = SimpleNamespace(flash_attn_func=flash_attn_func)
@@ -994,9 +998,10 @@ if device_type == "cuda":
 
 # FA3 status
 if _fa3 is not None:
-    print0("Using Flash Attention 3 (Hopper GPU detected)")
+    print0(f"Using attention backend {args.attention_backend}")
 else:
-    raise RuntimeError("Flash Attention 3 is required but not available. A Hopper (sm90) GPU is needed.")
+    raise RuntimeError(f"Requested {args.attention_backend} is unavailable; FA3 requires Hopper. "
+                       "Use --attention-backend fa2 for exploratory Ampere runs.")
 
 # Run / logging paths
 run_name, run_dir = resolve_run_dir(args.run_name)
@@ -1425,6 +1430,8 @@ if master_process:
         "pf_updates": pf_updates,
         "pf_generator_updates": pf_generator_updates,
         "pf_seconds_including_compile": pf_seconds,
+        "world_size": ddp_world_size,
+        "gpu_name": torch.cuda.get_device_name(device) if device_type == "cuda" else None,
     }
     with open(_result_out, "w") as f:
         json.dump(result, f, indent=2)
