@@ -22,7 +22,7 @@ This is not scheduled sampling: no real-token CE targets are used on generated c
 Changes relative to the paper: use a transformer's final normalized states instead
 of GRU pre-tanh activations, a small temporal convolution discriminator instead
 of a bidirectional GRU, and sparse updates on short conditional rollouts. Start
-at step 192, update every 8 steps, use 4 prefixes/rank of length 64, roll out 16
+at step 192, update every 8 steps, use up to 4 available prefixes/rank of length 64, roll out 16
 tokens, and use generator weight 0.02 on active steps (not rescaled by frequency).
 The discriminator gets only the 16 continuation states, with dropout and stochastic
 depth off in both domains. It trains at accuracy <=99%; the generator trains only
@@ -83,6 +83,16 @@ on the actual run. It accepts 1/2/4/8 GPUs via `TIGER_GPU_IDS` and records GPU t
 and world size in results. Start with `TIGER_MAX_STEPS=4` for memory/optimizer
 bring-up, then extend the same configuration to 224 steps to reach PF updates.
 Neither prefix is a completed performance comparison.
+With Tiger's device batch of 1, PF receives one prefix per rank; the H100 device
+batch supplies four. Account for this difference when interpreting exploratory
+Tiger results.
+
+`PYTHONPATH=. python tests/verify_compiled_pf.py --backend fa2` runs a separate
+full-model CUDA diagnostic on one GPU. It forces the generator gate open and
+checks two compiled BF16 replay backward passes for finite trunk gradients and
+gradient isolation. It does not run the training optimizer or establish memory
+headroom alongside the training graph. The normal 224-step smoke retains the
+paper's accuracy gate and is still required.
 
 Run as an `srun` step within an existing authorized allocation. The script uses a
 lock to prevent overlapping experiments from the same checkout. Do not cancel the
