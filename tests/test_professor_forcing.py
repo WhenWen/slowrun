@@ -49,11 +49,12 @@ def load_gpt_definitions(mtp_weight=0):
     finally:
         sys.argv = old_argv
     def attention(q, k, v, causal=False, window_size=(-1, -1)):
-        t = q.size(1)
-        i = torch.arange(t)
-        mask = i[:, None] >= i[None, :]
+        # FlashAttention aligns a shorter query to the RIGHT of the key cache.
+        qi = torch.arange(k.size(1) - q.size(1), k.size(1))
+        ki = torch.arange(k.size(1))
+        mask = qi[:, None] >= ki[None, :]
         if window_size[0] >= 0:
-            mask &= i[:, None] - i[None, :] <= window_size[0]
+            mask &= qi[:, None] - ki[None, :] <= window_size[0]
         return F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2),
                                               v.transpose(1, 2), attn_mask=mask).transpose(1, 2)
     module.flash_attn.flash_attn_func = attention
@@ -177,6 +178,76 @@ class ProfessorForcingTests(unittest.TestCase):
                 self.assertIsNotNone(param.grad, name)
                 self.assertTrue(torch.isfinite(param.grad).all(), name)
             model.zero_grad(set_to_none=True)
+
+    def test_attached_prefix_reuses_ce_and_preserves_full_parameter_gradients(self):
+        m = load_gpt_definitions(mtp_weight=.3)
+        cfg = m.GPTConfig(sequence_len=16, vocab_size=23, n_layer=4, n_head=2,
+                          n_kv_head=2, n_embd=32, dropout=0, stoch_depth=0,
+                          use_iha=True, window_pattern='SL')
+        for checkpointed in (False, True):
+            for dupe in (False, True):
+                with self.subTest(checkpointed=checkpointed, dupe=dupe):
+                    reference = m.GPT(replace(cfg, activation_checkpointing=checkpointed))
+                    reference.init_weights()
+                    if dupe:
+                        reference.set_dupe_layers(2, 3, 2)
+                    shared = copy.deepcopy(reference)
+                    x, y = torch.randint(23, (2, 16)), torch.randint(23, (2, 16))
+                    prefix, pf_batch = 11, 1
+                    fake = x[:pf_batch].clone()
+                    fake[:, prefix:] = torch.randint(23, (pf_batch, 16-prefix))
+                    probe = torch.randn(pf_batch, 16-prefix, cfg.n_embd)
+                    ce_ref, _ = reference(x, y)
+                    h_ref = reference(fake, return_hidden=True)[:, prefix:]
+                    pf_embedding_grad_ref, = torch.autograd.grad(
+                        (h_ref * probe).mean(), reference.transformer.wte.weight,
+                        retain_graph=True)
+                    (ce_ref + .02 * (h_ref * probe).mean()).backward()
+
+                    ce_shared, _, state = shared(x, y, cache_prefix=prefix, cache_batch=pf_batch)
+                    self.assertEqual(len(state['prefix_kv']), 6 if dupe else 4)
+                    self.assertTrue(all(k.requires_grad and v.requires_grad
+                                        for k, v in state['prefix_kv']))
+                    self.assertFalse(state['real_hidden'].requires_grad)
+                    self.assertFalse(state['next_logits'].requires_grad)
+                    h_shared = shared(fake[:, prefix:], past_key_values=state['prefix_kv'],
+                                      return_hidden=True)
+                    pf_embedding_grad_shared, = torch.autograd.grad(
+                        (h_shared * probe).mean(), shared.transformer.wte.weight,
+                        retain_graph=True)
+                    torch.testing.assert_close(pf_embedding_grad_shared, pf_embedding_grad_ref,
+                                               rtol=3e-4, atol=2e-6)
+                    torch.testing.assert_close(h_shared, h_ref, rtol=2e-5, atol=2e-6)
+                    torch.testing.assert_close(state['real_hidden'],
+                                               shared(x[:pf_batch], return_hidden=True)[:, prefix:])
+                    torch.testing.assert_close(state['next_logits'], shared(x[:pf_batch])[:, prefix-1])
+                    (ce_shared + .02 * (h_shared * probe).mean()).backward()
+                    for (name, expected), (_, actual) in zip(reference.named_parameters(), shared.named_parameters()):
+                        self.assertIsNotNone(expected.grad, name)
+                        self.assertIsNotNone(actual.grad, name)
+                        torch.testing.assert_close(actual.grad, expected.grad,
+                                                   rtol=3e-4, atol=2e-6, msg=name)
+
+    def test_incremental_cache_matches_full_context_through_sliding_windows_and_dupe(self):
+        m = load_gpt_definitions()
+        cfg = m.GPTConfig(sequence_len=16, vocab_size=23, n_layer=4, n_head=2,
+                          n_kv_head=2, n_embd=32, dropout=0, stoch_depth=0,
+                          use_iha=True, window_pattern='SL')
+        model = m.GPT(cfg).eval()
+        model.init_weights()
+        model.set_dupe_layers(2, 3, 2)
+        x = torch.randint(23, (2, 16))
+        with torch.no_grad():
+            full = model(x)
+            logits, cache = model(x[:, :10], return_cache=True)
+            torch.testing.assert_close(logits, full[:, :10])
+            for position in range(10, 16):
+                logits, cache = model(x[:, position:position+1], past_key_values=cache,
+                                      return_cache=True)
+                torch.testing.assert_close(logits, full[:, position:position+1],
+                                           rtol=2e-5, atol=2e-6)
+                self.assertEqual(len(cache), 6)
+                self.assertTrue(all(k.size(1) == position+1 for k, _ in cache))
 
     def test_checkpointing_preserves_mtp_dropout_gradients_and_pf_replay(self):
         m = load_gpt_definitions(mtp_weight=.3)

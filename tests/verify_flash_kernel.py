@@ -18,15 +18,16 @@ def main():
                         else 'kernels-community/flash-attn3', version=3 if args.backend == 'fa2' else 1)
     torch.manual_seed(42)
     report = []
-    for length in (80, 2048):
-        for window in ((-1, -1), (16, 0), (1024, 0)):
+    for query_length, key_length in ((80, 80), (2048, 2048), (1, 2048), (32, 2048), (128, 2048)):
+        for window in ((-1, -1), (16, 0), (1024, 0), (2048, 0)):
             inputs = [torch.randn(1, length, 2, 128, device='cuda', dtype=torch.bfloat16,
-                                   requires_grad=True) for _ in range(3)]
+                                   requires_grad=True) for length in (query_length, key_length, key_length)]
             reference = [x.detach().float().requires_grad_() for x in inputs]
-            position = torch.arange(length, device='cuda')
-            mask = position[:, None] >= position[None, :]
+            queries = torch.arange(key_length-query_length, key_length, device='cuda')
+            keys = torch.arange(key_length, device='cuda')
+            mask = queries[:, None] >= keys[None, :]
             if window[0] >= 0:
-                mask &= position[:, None] - position[None, :] <= window[0]
+                mask &= queries[:, None] - keys[None, :] <= window[0]
             expected = F.scaled_dot_product_attention(*(x.transpose(1, 2) for x in reference),
                                                        attn_mask=mask).transpose(1, 2)
             actual = kernel.flash_attn_func(*inputs, causal=True, window_size=window)
@@ -41,7 +42,8 @@ def main():
                                 / expected_grad.square().mean().sqrt().clamp_min(1e-12)).item()
                 assert relative_rms < .03, relative_rms
                 errors.append(relative_rms)
-            report.append(dict(length=length, window=window, gradient_relative_rms=errors))
+            report.append(dict(query_length=query_length, key_length=key_length,
+                               window=window, gradient_relative_rms=errors))
     print(json.dumps(dict(backend=args.backend, gpu=torch.cuda.get_device_name(),
                           status='PASS', cases=report), indent=2))
 

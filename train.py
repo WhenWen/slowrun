@@ -304,7 +304,7 @@ class CausalSelfAttention(nn.Module):
         d = self.head_dim
         return (mix @ weight.view(H, d, -1).flatten(1)).view_as(weight)
 
-    def forward(self, x, ve, cos_sin, window_size):
+    def forward(self, x, ve, cos_sin, window_size, past_kv=None, return_kv=False):
         B, T, C = x.size()
         if self.use_iha:
             # Fuse mixing into weights then project — grad flows through mix params
@@ -329,11 +329,15 @@ class CausalSelfAttention(nn.Module):
         cos, sin = cos_sin
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
+        if past_kv is not None:
+            k = torch.cat((past_kv[0], k), dim=1)
+            v = torch.cat((past_kv[1], v), dim=1)
         y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
         # Attention gate: per-head sigmoid gate
         y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate_channels])).unsqueeze(-1)
         y = y.contiguous().view(B, T, -1)
-        return self.resid_dropout(self.c_proj(y))
+        output = self.resid_dropout(self.c_proj(y))
+        return (output, (k, v)) if return_kv else output
 
 class MLP(nn.Module):
     def __init__(self, config):
@@ -355,18 +359,20 @@ class Block(nn.Module):
         # Stochastic depth: linear schedule from 0 at layer 0 to stoch_depth at last layer
         self.drop_prob = config.stoch_depth * (layer_idx / max(config.n_layer - 1, 1))
 
-    def forward(self, x, ve, cos_sin, window_size):
+    def forward(self, x, ve, cos_sin, window_size, past_kv=None, return_kv=False):
         # Stochastic depth: blend with identity when dropped (compile-friendly, no graph break)
         if self.training and self.drop_prob > 0:
             keep = (torch.rand((), device=x.device) >= self.drop_prob).to(x.dtype)
             x_in = x
-            x = x + self.attn(norm(x), ve, cos_sin, window_size)
+            attn = self.attn(norm(x), ve, cos_sin, window_size, past_kv, return_kv)
+            x = x + (attn[0] if return_kv else attn)
             x = x + self.mlp(norm(x))
             x = x_in + keep * (x - x_in)
         else:
-            x = x + self.attn(norm(x), ve, cos_sin, window_size)
+            attn = self.attn(norm(x), ve, cos_sin, window_size, past_kv, return_kv)
+            x = x + (attn[0] if return_kv else attn)
             x = x + self.mlp(norm(x))
-        return x
+        return (x, attn[1]) if return_kv else x
 
 
 class GPT(nn.Module):
@@ -536,71 +542,93 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def _run_block(self, block, x, ve, cos_sin, window_size):
+    def _run_block(self, block, x, ve, cos_sin, window_size, past_kv=None, return_kv=False):
         if self.config.activation_checkpointing and torch.is_grad_enabled():
-            return checkpoint(block, x, ve, cos_sin, window_size,
+            return checkpoint(block, x, ve, cos_sin, window_size, past_kv, return_kv,
                               use_reentrant=False, preserve_rng_state=True)
-        return block(x, ve, cos_sin, window_size)
+        return block(x, ve, cos_sin, window_size, past_kv, return_kv)
 
-    def _run_decoder_layers(self, x, x0, encoder_outputs, start, end, T):
-        """Run decoder layers [start, end), with U-Net skip connections."""
-        cos_sin = (self.cos[:, :T], self.sin[:, :T])
-        for i in range(start, end):
-            # Encoder layer j connects to decoder layer (n_layer - 1 - j)
-            j = self.config.n_layer - 1 - i
-            if 0 <= j < self.encoder_layers:
-                x = x + self.skip_weights[i - self.encoder_layers] * encoder_outputs[j]
-            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
-            x = self._run_block(self.transformer.h[i], x, ve, cos_sin, self.window_sizes[i])
-        return x
+    def _layer_execution_order(self):
+        if self._dupe_layers is None:
+            return list(range(self.config.n_layer))
+        start, end = self._dupe_layers
+        return (list(range(end)) + list(range(start, end)) * self._dupe_loops
+                + list(range(end, self.config.n_layer)))
 
-    def forward(self, idx, targets=None, loss_reduction='mean', return_hidden=False, logit_positions=None):
+    def forward(self, idx, targets=None, loss_reduction='mean', return_hidden=False,
+                logit_positions=None, past_key_values=None, return_cache=False,
+                cache_prefix=0, cache_batch=0):
+        """Ordinary CE optionally exports an attached prefix cache for a second branch.
+
+        Caches are indexed by layer execution, including each duplicated pass.
+        A cache is never detached here: a suffix loss can backpropagate through
+        its shared prefix. Callers detach explicitly for no-gradient sampling.
+        """
         B, T = idx.size()
+        position = 0 if past_key_values is None else past_key_values[0][0].size(1)
+        collect_cache = return_cache or cache_prefix > 0
+        if (collect_cache or past_key_values is not None) and self.training and self.config.stoch_depth > 0:
+            raise ValueError("Cached training requires shared stochastic-depth masks; use the benchmark's stoch_depth=0")
+        order = self._layer_execution_order()
+        if past_key_values is not None and len(past_key_values) != len(order):
+            raise ValueError("KV cache must contain one entry per layer execution")
+        if cache_prefix and not (0 < cache_prefix < T and past_key_values is None):
+            raise ValueError("Exported training prefix must be inside the input sequence")
+        if past_key_values is not None and targets is not None:
+            raise ValueError("Cached continuation does not accept CE/MTP targets")
+        if return_cache and targets is not None:
+            raise ValueError("Use cache_prefix to export a cache from CE/MTP training")
         x = norm(self.transformer.wte(idx))
         x0 = x
-        cos_sin = (self.cos[:, :T], self.sin[:, :T])
+        cos_sin = (self.cos[:, position:position+T], self.sin[:, position:position+T])
 
-        # Encoder half: run layers and collect outputs for skip connections
         encoder_outputs = []
-        for i in range(self.encoder_layers):
+        caches = []
+        for visit, i in enumerate(order):
+            if i >= self.encoder_layers:
+                j = self.config.n_layer - 1 - i
+                if 0 <= j < self.encoder_layers:
+                    x = x + self.skip_weights[i - self.encoder_layers] * encoder_outputs[j]
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
-            x = self._run_block(self.transformer.h[i], x, ve, cos_sin, self.window_sizes[i])
-            encoder_outputs.append(x)
-
-        # Decoder half
-        dupe = self._dupe_layers
-        if dupe is None:
-            x = self._run_decoder_layers(x, x0, encoder_outputs,
-                                        self.encoder_layers, self.config.n_layer, T)
-        else:
-            # First pass: encoder boundary through end of dupe range
-            x = self._run_decoder_layers(x, x0, encoder_outputs,
-                                        self.encoder_layers, dupe[1], T)
-            # Extra replays through dupe range
-            for _ in range(self._dupe_loops):
-                x = self._run_decoder_layers(x, x0, encoder_outputs,
-                                            dupe[0], dupe[1], T)
-            # Remaining decoder layers
-            x = self._run_decoder_layers(x, x0, encoder_outputs,
-                                        dupe[1], self.config.n_layer, T)
+            past = None if past_key_values is None else past_key_values[visit]
+            output = self._run_block(self.transformer.h[i], x, ve, cos_sin,
+                                     self.window_sizes[i], past, collect_cache)
+            if collect_cache:
+                x, kv = output
+                if cache_prefix:
+                    b = min(cache_batch or B, B)
+                    kv = tuple(t[:b, :cache_prefix] for t in kv)
+                caches.append(kv)
+            else:
+                x = output
+            if i < self.encoder_layers:
+                encoder_outputs.append(x)
 
         x = norm(x)
         if return_hidden:
-            return x
+            return (x, tuple(caches)) if return_cache else x
         if logit_positions is not None:
             x = x.index_select(1, logit_positions)
         logits = self.lm_head(x)[..., :self.config.vocab_size].float()
         logits = LOGIT_CAP * torch.tanh(logits / LOGIT_CAP) if LOGIT_CAP > 0 else logits
         if targets is None:
-            return logits
+            return (logits, tuple(caches)) if return_cache else logits
+        training_state = None
+        if cache_prefix:
+            b = min(cache_batch or B, B)
+            training_state = {
+                'prefix_kv': tuple(caches),
+                'real_hidden': x[:b, cache_prefix:].detach(),
+                'next_logits': logits[:b, cache_prefix-1].detach(),
+            }
         lm_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
                                   ignore_index=-1, reduction=loss_reduction)
         if loss_reduction != 'mean':
             return lm_loss
         if self.mtp_weight <= 0:
-            return lm_loss, {'lm_loss': lm_loss}
+            result = (lm_loss, {'lm_loss': lm_loss})
+            return (*result, training_state) if cache_prefix else result
         mtp_emb = norm(self.transformer.wte(targets[:, :-1].clamp(min=0)))
         combined = self.mtp_proj(torch.cat([x[:, :-1], mtp_emb], dim=-1))
         mT = combined.size(1)
@@ -612,7 +640,8 @@ class GPT(nn.Module):
         mtp_loss = F.cross_entropy(mtp_logits.view(-1, mtp_logits.size(-1)),
                                    targets[:, 1:].reshape(-1), ignore_index=-1)
         loss = lm_loss + self.mtp_weight * mtp_loss
-        return loss, {'lm_loss': lm_loss, 'mtp_loss': mtp_loss}
+        result = (loss, {'lm_loss': lm_loss, 'mtp_loss': mtp_loss})
+        return (*result, training_state) if cache_prefix else result
 
 # =============================================================================
 # Optimizer: MuonAdamW (Muon for matrices, AdamW for embeddings/scalars)
