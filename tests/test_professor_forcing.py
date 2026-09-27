@@ -84,6 +84,26 @@ def distributed_pf_worker(rank, rendezvous):
             assert metrics['pf_g_enabled'] == 1
             assert model.embedding.weight.grad.norm() > 0
             model.zero_grad(set_to_none=True)
+        m = load_gpt_definitions(mtp_weight=.3)
+        cfg = m.GPTConfig(sequence_len=16, vocab_size=23, n_layer=2, n_head=2,
+                          n_kv_head=2, n_embd=32, dropout=.05, stoch_depth=0,
+                          use_iha=True)
+        model = m.GPT(cfg).train()
+        model.init_weights()
+        pf = ProfessorForcing(32, torch.device('cpu'), context=12, rollout=4,
+                              batch=1, generator_min_accuracy=-1)
+        for _ in range(2):
+            x, y = torch.randint(23, (1, 16)), torch.randint(23, (1, 16))
+            ce, _, state = model(x, y, cache_prefix=12)
+            adversarial, metrics = pf.amortized_loss(model, model, state, .02)
+            (ce + adversarial).backward()
+            assert metrics['pf_g_enabled'] == 1
+            assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
+            flat = torch.cat([p.detach().flatten() for p in pf.discriminator.parameters()])
+            gathered = [torch.empty_like(flat) for _ in range(2)]
+            dist.all_gather(gathered, flat)
+            torch.testing.assert_close(gathered[0], gathered[1], rtol=0, atol=0)
+            model.zero_grad(set_to_none=True)
     finally:
         dist.destroy_process_group()
 
