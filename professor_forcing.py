@@ -39,6 +39,21 @@ def sample_continuation(model, prompt, length, generator=None):
     return tokens
 
 
+@torch.no_grad()
+def sample_cached_continuation(decode_model, state, length, generator=None):
+    """Reuse CE's last-prefix logits, then decode only new tokens with a KV cache."""
+    cache = tuple(tuple(t.detach() for t in kv) for kv in state['prefix_kv'])
+    logits = state['next_logits']
+    samples = []
+    for offset in range(length):
+        token = torch.multinomial(logits.float().softmax(-1), 1, generator=generator)
+        samples.append(token)
+        if offset + 1 < length:
+            logits, cache = decode_model(token, past_key_values=cache, return_cache=True)
+            logits = logits[:, 0]
+    return torch.cat(samples, dim=1)
+
+
 def global_mean(tensor):
     value = tensor.detach().clone()
     if dist.is_initialized():
@@ -61,6 +76,56 @@ class ProfessorForcing:
             self.discriminator = BehaviorDiscriminator(width, hidden).to(device)
         self.optimizer = torch.optim.AdamW(self.discriminator.parameters(), lr=lr, weight_decay=0)
         self.generator = torch.Generator(device=device).manual_seed(2718 + (dist.get_rank() if dist.is_initialized() else 0))
+
+    def _train_discriminator(self, real, fake):
+        d = self.discriminator
+        real_logits, fake_logits = d(real.detach()), d(fake.detach())
+        d_loss = F.softplus(-real_logits).mean() + F.softplus(fake_logits).mean()
+        accuracy = global_mean(0.5 * ((real_logits > 0).float().mean() + (fake_logits < 0).float().mean()))
+        self.optimizer.zero_grad(set_to_none=True)
+        if accuracy.item() <= 0.99:
+            d_loss.backward()
+            if dist.is_initialized():
+                for param in d.parameters():
+                    dist.all_reduce(param.grad)
+                    param.grad.div_(dist.get_world_size())
+            self.optimizer.step()
+        self.optimizer.zero_grad(set_to_none=True)
+        return d_loss, accuracy
+
+    def amortized_loss(self, model, decode_model, state, weight):
+        """Return PF loss for ONE joint backward with the CE that exported state.
+
+        Real states and the attached prefix KV come from that CE forward. Sampling
+        detaches the cache; differentiable suffix replay uses the original cache.
+        Both domains use the CE training mode (including dropout), avoiding a
+        train/eval classification cue. Replay draws fresh suffix dropout noise.
+        PF randomness is isolated from subsequent ordinary CE microbatches.
+        """
+        real = state['real_hidden']
+        if real.size(1) != self.rollout:
+            raise ValueError("CE continuation length must equal the PF rollout")
+        if model.training != state['training'] or decode_model.training != state['training']:
+            raise ValueError("CE, sampling, and PF replay must use the same train/eval mode")
+        device = real.device
+        devices = [device.index] if device.type == 'cuda' else []
+        with torch.random.fork_rng(devices=devices), torch.autocast(
+                device.type, enabled=torch.is_autocast_enabled(device.type),
+                dtype=torch.get_autocast_dtype(device.type), cache_enabled=False):
+            tokens = sample_cached_continuation(decode_model, state, self.rollout, self.generator)
+            fake = model(tokens, past_key_values=state['prefix_kv'], return_hidden=True)
+            d_loss, accuracy = self._train_discriminator(real, fake)
+            enabled = accuracy.item() > self.generator_min_accuracy
+            g_loss = torch.zeros((), device=device)
+            if enabled:
+                self.discriminator.requires_grad_(False)
+                try:
+                    g_loss = F.softplus(-self.discriminator(fake)).mean()
+                finally:
+                    self.discriminator.requires_grad_(True)
+            metrics = {'pf_d_loss': global_mean(d_loss), 'pf_g_loss': global_mean(g_loss),
+                       'pf_accuracy': accuracy, 'pf_g_enabled': float(enabled)}
+            return weight * g_loss, metrics
 
     def backward(self, model, tokens, weight):
         """Accumulate weighted generator gradient; update synchronized discriminator.
@@ -89,18 +154,7 @@ class ProfessorForcing:
                 real = model(real_tokens, return_hidden=True)[:, p:]
                 fake = model(fake_tokens, return_hidden=True)[:, p:]
             d = self.discriminator
-            real_logits, fake_logits = d(real.detach()), d(fake.detach())
-            d_loss = F.softplus(-real_logits).mean() + F.softplus(fake_logits).mean()
-            accuracy = global_mean(0.5 * ((real_logits > 0).float().mean() + (fake_logits < 0).float().mean()))
-            self.optimizer.zero_grad(set_to_none=True)
-            if accuracy.item() <= 0.99:
-                d_loss.backward()
-                if dist.is_initialized():
-                    for param in d.parameters():
-                        dist.all_reduce(param.grad)
-                        param.grad.div_(dist.get_world_size())
-                self.optimizer.step()
-            self.optimizer.zero_grad(set_to_none=True)
+            d_loss, accuracy = self._train_discriminator(real, fake)
             g_loss = torch.zeros((), device=tokens.device)
             enabled = accuracy.item() > self.generator_min_accuracy
             if enabled:

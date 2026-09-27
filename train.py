@@ -621,6 +621,7 @@ class GPT(nn.Module):
                 'prefix_kv': tuple(caches),
                 'real_hidden': x[:b, cache_prefix:].detach(),
                 'next_logits': logits[:b, cache_prefix-1].detach(),
+                'training': self.training,
             }
         lm_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
                                   ignore_index=-1, reduction=loss_reduction)

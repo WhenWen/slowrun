@@ -249,6 +249,48 @@ class ProfessorForcingTests(unittest.TestCase):
                 self.assertEqual(len(cache), 6)
                 self.assertTrue(all(k.size(1) == position+1 for k, _ in cache))
 
+    def test_amortized_pf_reuses_ce_and_preserves_dropout_rng_and_closed_gate_gradients(self):
+        m = load_gpt_definitions(mtp_weight=.3)
+        cfg = m.GPTConfig(sequence_len=16, vocab_size=23, n_layer=4, n_head=2,
+                          n_kv_head=2, n_embd=32, dropout=.1, stoch_depth=0,
+                          use_iha=True, activation_checkpointing=True)
+        reference = m.GPT(cfg).train()
+        reference.init_weights()
+        for gate in (1.0, -1.0):
+            model = copy.deepcopy(reference)
+            pf = ProfessorForcing(32, torch.device('cpu'), context=11, rollout=5,
+                                  batch=1, generator_min_accuracy=gate)
+            x, y = torch.randint(23, (2, 16)), torch.randint(23, (2, 16))
+            reference.zero_grad(set_to_none=True)
+            torch.manual_seed(812)
+            with torch.autocast('cpu', dtype=torch.bfloat16):
+                baseline, _ = reference(x, y)
+            (baseline / 8).backward()
+            calls = []
+            hook = model.register_forward_pre_hook(
+                lambda module, inputs, kwargs: calls.append(inputs[0].size(1)), with_kwargs=True)
+            torch.manual_seed(812)
+            with torch.autocast('cpu', dtype=torch.bfloat16):
+                ce, _, state = model(x, y, cache_prefix=11, cache_batch=1)
+                rng = torch.get_rng_state().clone()
+                loss, metrics = pf.amortized_loss(model, model, state, .02)
+                self.assertTrue(torch.equal(rng, torch.get_rng_state()))
+                self.assertTrue(all(p.grad is None for p in model.parameters()))
+            (ce / 8 + loss).backward()
+            hook.remove()
+            self.assertEqual(calls, [16, 1, 1, 1, 1, 5])
+            self.assertTrue(model.training)
+            self.assertEqual(metrics['pf_g_enabled'], float(gate < 0))
+            self.assertTrue(all(p.grad is None for p in pf.discriminator.parameters()))
+            differences = []
+            for (name, expected), (_, actual) in zip(reference.named_parameters(), model.named_parameters()):
+                self.assertTrue(torch.isfinite(actual.grad).all(), name)
+                if gate == 1:
+                    torch.testing.assert_close(actual.grad, expected.grad, rtol=0, atol=0, msg=name)
+                differences.append((actual.grad - expected.grad).abs().sum())
+            if gate < 0:
+                self.assertGreater(torch.stack(differences).sum().item(), 0)
+
     def test_checkpointing_preserves_mtp_dropout_gradients_and_pf_replay(self):
         m = load_gpt_definitions(mtp_weight=.3)
         cfg = m.GPTConfig(sequence_len=16, vocab_size=13, n_layer=4, n_head=2,
