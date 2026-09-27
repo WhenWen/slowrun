@@ -25,8 +25,8 @@ This is not scheduled sampling: no real-token CE targets are used on generated c
 Changes relative to the paper: use a transformer's final normalized states instead
 of GRU pre-tanh activations, a small temporal convolution discriminator instead
 of a bidirectional GRU, and sparse conditional rollouts. Each PF branch preserves
-the full 2048-token context: `prefix = 2048 - rollout`. The provisional rollout
-default is 32; compare it with longer rollouts before selecting a benchmark recipe.
+the full 2048-token context: `prefix = 2048 - rollout`. The first comparison uses
+1920 prompt tokens and 128 generated tokens. A 32-token rollout remains an ablation.
 Start at step 192, update every 8 steps, use up to 4 available examples/rank, and
 use generator weight 0.02 on active steps (not rescaled by frequency).
 
@@ -68,6 +68,14 @@ empirical question; short rollouts may be too weak, or overhead may erase the ga
    validation loss, discriminator accuracy/activation, step time and total wall time.
 5. If promising, adjust frequency/rollout/weight and repeat a second seed. Treat
    every exploratory run separately; do not hide extra work inside a submitted run.
+
+Full-model, batch-one A5000 diagnostics passed two compiled BF16 joint backward
+passes at both rollout lengths with checkpointing. Warm CE+PF forward/backward
+took 1.256s for rollout32 and 3.411s for rollout128; PF forward components were
+0.723s and 2.869s respectively. Both peaked at 17,445.5MiB allocated. These
+forced-gate, single-microbatch measurements exclude the optimizer and do not
+establish eight-GPU overhead or H100 budget compliance. The longer rollout was
+selected to test a longer free-running horizon, with its cost explicitly measured.
 
 The script logs both upstream-style training time (which omits warmup steps) and
 full script wall time including compilation and evaluation. The accepted
@@ -112,6 +120,10 @@ an `afterok` dependency on the user's smoke job and cancels if that dependency
 fails. Baseline failure stops the pair before PF starts. Both runs have separate
 result/checkpoint directories; sharing a node and compile cache is recorded when
 comparing wall time. The per-run training budget remains one hour.
+The smoke allocation first runs separate Hopper attention and full-model PF
+gradient preflights (per-rank batch4, generator gate forced open), then launches
+the normal eight-rank smoke with its natural accuracy gate. Preflight timings
+are not training results. Comparison jobs use their own job-specific compile cache.
 
 ## Tiger6 development
 
@@ -134,7 +146,7 @@ batch supplies four. Account for this difference when interpreting exploratory
 Tiger results.
 
 `PYTHONPATH=. python tests/verify_cached_pf.py --backend fa2 --rollout 32
---activation-checkpointing` runs a small-model/full-context CUDA diagnostic.
+--batch-size 1 --activation-checkpointing` runs a small-model/full-context CUDA diagnostic.
 Add `--full-model` for the actual 1.44B model. It forces the generator gate open,
 checks two compiled BF16 joint CE/PF backward passes, and fails if cached decoding
 keeps compiling new graphs as its context grows. It does not run the optimizer or

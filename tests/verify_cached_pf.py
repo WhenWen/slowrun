@@ -21,12 +21,13 @@ from professor_forcing import ProfessorForcing
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--backend', choices=['fa2', 'fa3'], required=True)
-    parser.add_argument('--rollout', type=int, default=32)
+    parser.add_argument('--rollout', type=int, default=None,
+                        help='Defaults to the main trainer rollout')
+    parser.add_argument('--batch-size', type=int, default=None,
+                        help='Defaults to the main trainer per-rank batch; use 1 on Tiger')
     parser.add_argument('--full-model', action='store_true')
     parser.add_argument('--activation-checkpointing', action='store_true')
     args = parser.parse_args()
-    if not 4 <= args.rollout < 2048:
-        parser.error('rollout must be between 4 and 2047')
     module = types.ModuleType('cached_pf_gpu_diagnostic')
     sys.modules[module.__name__] = module
     source = Path(__file__).resolve().parents[1].joinpath('train.py').read_text()
@@ -37,6 +38,14 @@ def main():
                      'train.py', 'exec'), module.__dict__)
     finally:
         sys.argv = old_argv
+    if args.rollout is None:
+        args.rollout = module.args.pf_rollout
+    if args.batch_size is None:
+        args.batch_size = module.args.device_batch_size
+    if not 4 <= args.rollout < 2048:
+        parser.error('rollout must be between 4 and 2047')
+    if args.batch_size < 1:
+        parser.error('batch size must be positive')
     device = torch.device('cuda', 0)
     torch.cuda.set_device(device)
     torch.manual_seed(42)
@@ -52,13 +61,14 @@ def main():
     model = torch.compile(original, dynamic=False)
     decode = torch.compile(original, dynamic=True)
     pf = ProfessorForcing(config.n_embd, device, context=2048-args.rollout,
-                          rollout=args.rollout, batch=1, generator_min_accuracy=-1)
+                          rollout=args.rollout, batch=args.batch_size, generator_min_accuracy=-1)
     print(json.dumps({'phase': 'model_ready', 'full_model': args.full_model,
                       'parameters': sum(p.numel() for p in original.parameters()),
                       'context_length': 2048, 'rollout': args.rollout,
+                      'batch_size': args.batch_size,
                       'forced_generator_gate': True}), flush=True)
     for iteration in range(2):
-        tokens = torch.randint(vocab, (1, 2049), device=device)
+        tokens = torch.randint(vocab, (args.batch_size, 2049), device=device)
         graph_counts = []
 
         def checked_decode(*inputs, **kwargs):
@@ -73,7 +83,7 @@ def main():
         start = time.perf_counter()
         with torch.autocast('cuda', dtype=torch.bfloat16):
             ce, _, state = model(tokens[:, :-1], tokens[:, 1:], cache_prefix=2048-args.rollout,
-                                 cache_batch=1)
+                                 cache_batch=args.batch_size)
             torch.cuda.synchronize()
             ce_seconds = time.perf_counter() - start
             pf_start = time.perf_counter()

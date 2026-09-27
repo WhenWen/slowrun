@@ -105,7 +105,7 @@ parser.add_argument("--pf-every", type=int, default=8)
 parser.add_argument("--pf-start-step", type=int, default=192)
 parser.add_argument("--pf-context", type=int, default=None,
                     help="Optional consistency check: must equal sequence length minus PF rollout")
-parser.add_argument("--pf-rollout", type=int, default=32)
+parser.add_argument("--pf-rollout", type=int, default=128)
 parser.add_argument("--pf-batch", type=int, default=4)
 parser.add_argument("--pf-min-accuracy", type=float, default=0.75)
 parser.add_argument("--max-steps", type=int, default=0, help="Smoke: stop after N steps, preserving the full LR schedule")

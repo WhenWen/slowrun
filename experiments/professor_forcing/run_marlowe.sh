@@ -32,6 +32,8 @@ esac
 run_name="pf-${mode}-${SLURM_JOB_ID}"
 export PATH="$PWD/.venv/bin:$PATH"
 export OMP_NUM_THREADS=1
+export TORCHINDUCTOR_COMPILE_THREADS=4
+export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 export WANDB_MODE=offline
 export PYTHONUNBUFFERED=1
 export TIKTOKEN_CACHE_DIR="$PWD/.cache/tiktoken"
@@ -47,6 +49,12 @@ nvidia-smi --query-gpu=name,memory.total --format=csv
 git rev-parse HEAD
 python -c 'import torch; print("torch", torch.__version__); assert torch.cuda.device_count() == 8; assert torch.cuda.get_device_capability()[0] == 9'
 python -c 'from prepare_data import verify_hash; verify_hash("fineweb_data/fineweb_train.pt"); verify_hash("fineweb_data/fineweb_val.pt")'
+if [[ "$mode" == smoke ]]; then
+    # Separate preflights, not benchmark results: validate Hopper's rectangular
+    # kernel and force the full PF gradient path at the actual per-rank batch.
+    python tests/verify_flash_kernel.py --backend fa3
+    python tests/verify_cached_pf.py --backend fa3 --full-model
+fi
 args=(--run-name "$run_name" --logit-avg-dir "runs/$run_name/ensemble")
 if [[ "$mode" != baseline ]]; then args+=(--pf-weight 0.02); fi
 if [[ "$mode" == smoke ]]; then args+=(--max-steps 224); fi
