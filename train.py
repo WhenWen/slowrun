@@ -103,8 +103,9 @@ parser.add_argument("--mg-plastic", type=str, default="matrix_all", choices=["ma
 parser.add_argument("--pf-weight", type=float, default=0.0, help="Professor Forcing generator weight (0=off)")
 parser.add_argument("--pf-every", type=int, default=8)
 parser.add_argument("--pf-start-step", type=int, default=192)
-parser.add_argument("--pf-context", type=int, default=64)
-parser.add_argument("--pf-rollout", type=int, default=16)
+parser.add_argument("--pf-context", type=int, default=None,
+                    help="Optional consistency check: must equal sequence length minus PF rollout")
+parser.add_argument("--pf-rollout", type=int, default=32)
 parser.add_argument("--pf-batch", type=int, default=4)
 parser.add_argument("--pf-min-accuracy", type=float, default=0.75)
 parser.add_argument("--max-steps", type=int, default=0, help="Smoke: stop after N steps, preserving the full LR schedule")
@@ -130,6 +131,11 @@ N_EMBD = args.n_embd if args.n_embd is not None else 768
 N_HEAD = args.n_head if args.n_head is not None else 6
 HEAD_DIM = N_EMBD // N_HEAD
 MAX_SEQ_LEN = 2048
+if not 0 < args.pf_rollout < MAX_SEQ_LEN:
+    parser.error("PF rollout must be inside the full training sequence")
+if args.pf_context is not None and args.pf_context != MAX_SEQ_LEN - args.pf_rollout:
+    parser.error("PF uses the full training context: context + rollout must equal 2048")
+args.pf_context = MAX_SEQ_LEN - args.pf_rollout
 WINDOW_PATTERN = "SSSL"
 TOTAL_BATCH_SIZE = args.total_batch_size
 EVAL_TOKENS = 10_000_000
@@ -1130,10 +1136,13 @@ model = torch.compile(model, dynamic=False)
 # Optimizer
 optimizer = model.setup_optimizer()
 pf = None
+pf_decode_model = None
 if args.pf_weight > 0:
     from professor_forcing import ProfessorForcing
     pf = ProfessorForcing(N_EMBD, device, context=args.pf_context, rollout=args.pf_rollout,
                          batch=args.pf_batch, generator_min_accuracy=args.pf_min_accuracy)
+    # A growing KV cache needs symbolic sequence lengths, not one graph/token.
+    pf_decode_model = torch.compile(orig_model, dynamic=True)
     print0(f"Professor Forcing: {vars(args)}")
 
 # ---- every-step meta-gradient step ----
@@ -1259,6 +1268,8 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
         print0(f"\n=== Enabling dupe-layers at epoch {current_epoch} ===")
         orig_model.set_dupe_layers(args.dupe_layers_start, args.dupe_layers_end, args.dupe_loops)
         model = torch.compile(orig_model, dynamic=False)
+        if pf is not None:
+            pf_decode_model = torch.compile(orig_model, dynamic=True)
         # model = orig_model # replace compile with this line for eager mode
         dupe_active = True
         timing_start_step = step + 4  # skip dupe recompile + 3 warmup steps
@@ -1268,38 +1279,42 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
     synchronize()
     t0 = time.time()
     pf_metrics = {}
-    if pf is not None and step >= args.pf_start_step and step % args.pf_every == 0:
-        pf_t0 = time.perf_counter()
+    pf_due = pf is not None and step >= args.pf_start_step and step % args.pf_every == 0
+    use_mg = MG and step % args.mg_every == 0 and grad_accum_steps >= 2
+    half = grad_accum_steps // 2
+    for micro_step in range(grad_accum_steps):
         with autocast_ctx:
-            pf_metrics = pf.backward(model, x, args.pf_weight)
-        synchronize()
-        pf_dt = time.perf_counter() - pf_t0
-        pf_seconds += pf_dt
-        pf_updates += 1
-        pf_generator_updates += int(pf_metrics["pf_g_enabled"])
-        pf_metrics["pf_seconds"] = pf_dt
-    if MG and step % args.mg_every == 0 and grad_accum_steps >= 2:
-        # split pairing: the first half of this step's micro-batches adapts, the second half is
-        # evaluated at the adapted point; the optimizer receives the ordinary full-batch mean gradient
-        half = grad_accum_steps // 2
-        for micro_step in range(grad_accum_steps):
-            with autocast_ctx:
+            if pf_due and micro_step == 0:
+                loss, metrics, state = model(x, y, cache_prefix=args.pf_context,
+                                             cache_batch=args.pf_batch)
+                synchronize()
+                pf_t0 = time.perf_counter()
+                pf_loss, pf_metrics = pf.amortized_loss(model, pf_decode_model, state, args.pf_weight)
+                synchronize()
+                pf_dt = time.perf_counter() - pf_t0
+                pf_seconds += pf_dt
+                pf_updates += 1
+                pf_generator_updates += int(pf_metrics["pf_g_enabled"])
+                # Joint backward cannot be uniquely split into CE and PF time.
+                # The enclosing step timer includes ALL forward/backward work.
+                pf_metrics['pf_forward_seconds'] = pf_dt
+                combined_loss = loss / grad_accum_steps + pf_loss
+            else:
                 loss, metrics = model(x, y)
-            train_loss = loss.detach()
-            (loss / grad_accum_steps).backward()
-            x, y, epoch = next(train_loader)
-            if micro_step == half - 1:
-                mg_kept, mg_alpha = mg_temporary_step(step)
+                combined_loss = loss / grad_accum_steps
+        train_loss = loss.detach()
+        combined_loss.backward()
+        if pf_due and micro_step == 0:
+            del state, pf_loss
+        x, y, epoch = next(train_loader)
+        # PF shares the first CE microbatch and participates in the existing
+        # first-half meta-gradient adaptation before the temporary update.
+        if use_mg and micro_step == half - 1:
+            mg_kept, mg_alpha = mg_temporary_step(step)
+    if use_mg:
         with torch.no_grad():
             torch._foreach_add_(mg_owned_params, mg_kept, alpha=-mg_alpha)   # restore the owned matrices
         del mg_kept
-    else:
-        for micro_step in range(grad_accum_steps):
-            with autocast_ctx:
-                loss, metrics = model(x, y)
-            train_loss = loss.detach()
-            (loss / grad_accum_steps).backward()
-            x, y, epoch = next(train_loader)
 
     # Update optimizer
     lrm = get_lr_multiplier(step)
@@ -1471,7 +1486,7 @@ if master_process:
         "wall_seconds_including_compile_eval": time.time() - _script_start,
         "pf_updates": pf_updates,
         "pf_generator_updates": pf_generator_updates,
-        "pf_seconds_including_compile": pf_seconds,
+        "pf_forward_seconds_including_compile": pf_seconds,
         "world_size": ddp_world_size,
         "gpu_name": torch.cuda.get_device_name(device) if device_type == "cuda" else None,
     }

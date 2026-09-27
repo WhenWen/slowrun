@@ -3,6 +3,9 @@
 Base: qlabs-eng/slowrun commit `c6f0fa1b415994e0c5cf163990fe253fe1622883`.
 Target: root limited-compute track, one 8×H100 node, at most one hour.
 The upstream reported record is 3.183 validation loss. No improvement is claimed yet.
+The full-context, amortized implementation is undergoing runtime validation.
+The earlier 64+16-token standalone PF design is retired: it did not exercise the
+model's 1024/2048 attention windows or reuse ordinary training computation.
 
 ## Paper and adaptation
 
@@ -21,15 +24,31 @@ This is not scheduled sampling: no real-token CE targets are used on generated c
 
 Changes relative to the paper: use a transformer's final normalized states instead
 of GRU pre-tanh activations, a small temporal convolution discriminator instead
-of a bidirectional GRU, and sparse updates on short conditional rollouts. Start
-at step 192, update every 8 steps, use up to 4 available prefixes/rank of length 64, roll out 16
-tokens, and use generator weight 0.02 on active steps (not rescaled by frequency).
-The discriminator gets only the 16 continuation states, with dropout and stochastic
-depth off in both domains. It trains at accuracy <=99%; the generator trains only
-above 75%, following the paper. Accuracy and discriminator gradients are synchronized
-across ranks. PF uses a separate sampling RNG and preserves the base initialization RNG.
-Its gradient is accumulated before CE/MTP microbatches, so it participates in the
-existing first-order meta-gradient adaptation.
+of a bidirectional GRU, and sparse conditional rollouts. Each PF branch preserves
+the full 2048-token context: `prefix = 2048 - rollout`. The provisional rollout
+default is 32; compare it with longer rollouts before selecting a benchmark recipe.
+Start at step 192, update every 8 steps, use up to 4 available examples/rank, and
+use generator weight 0.02 on active steps (not rescaled by frequency).
+
+The first ordinary CE/MTP microbatch supplies real continuation states, prefix
+KV, and the first sampling logits. Incremental sampling detaches that KV cache;
+a parallel differentiable replay of only the generated suffix uses the ORIGINAL,
+attached KV. This preserves the PF gradient through the shared prefix. The joint
+CE/PF backward traverses that prefix once and participates in the existing
+first-half meta-gradient adaptation. Cache entries correspond to layer execution
+visits, including each repeated decoder pass, rather than just physical layers.
+The cached decoder uses symbolic lengths to avoid recompiling once per token.
+
+The discriminator sees only continuation states. Teacher and free branches both
+use the ordinary CE training mode, including dropout; using train-mode teacher
+states against eval-mode free states would introduce a domain cue. Replay draws
+fresh suffix dropout noise, so this is a stochastic replay adaptation, not a
+claim to reproduce the sampling pass's exact dropout realization. PF isolates its
+RNG use from subsequent CE microbatches. The benchmark's stochastic depth is zero;
+cached training rejects nonzero stochastic depth until shared masks are supported.
+The discriminator trains at accuracy <=99%; the generator trains only above 75%.
+Accuracy and discriminator gradients are synchronized across ranks. Discriminator
+initialization and token sampling use isolated RNGs.
 
 The paper reports character-level PTB improvement, but no word-level PTB improvement,
 and approximately 3× training cost in its character experiment. Gains here are an
@@ -37,13 +56,17 @@ empirical question; short rollouts may be too weak, or overhead may erase the ga
 
 ## Validation and experiment plan
 
-1. Unit tests check genuinely autoregressive feedback, causality of the actual GPT,
-   sampling/replay equivalence, gradient isolation, gating, and RNG isolation.
-2. Full-size eight-GPU smoke, changing only the stopping step to 224. Preserve the
+1. Unit tests check actual-GPT cached/full output and gradient equivalence, including
+   IHA, sliding windows, repeated layers and checkpointing; closed-gate BF16 dropout
+   gradients match ordinary CE, and the shared implementation avoids teacher replay.
+2. GPU diagnostics check rectangular attention, compiled dynamic-cache reuse and
+   joint gradients. Profile rollout lengths and full-model memory before choosing
+   the recipe; these diagnostics do not establish optimizer memory or quality.
+3. Full-size eight-GPU smoke, changing only the stopping step to 224. Preserve the
    11-epoch schedule, model, batch, data, optimizer, and evaluation settings.
-3. Matched upstream baseline and PF runs on the same hardware and seed. Compare
+4. Matched upstream baseline and PF runs on the same hardware and seed. Compare
    validation loss, discriminator accuracy/activation, step time and total wall time.
-4. If promising, adjust frequency/rollout/weight and repeat a second seed. Treat
+5. If promising, adjust frequency/rollout/weight and repeat a second seed. Treat
    every exploratory run separately; do not hide extra work inside a submitted run.
 
 The script logs both upstream-style training time (which omits warmup steps) and
@@ -56,6 +79,9 @@ reports training time: its submitted seed43
 while always disclosing both numbers and any changes to warmup accounting.
 Our first PF update at step192 currently includes PF compilation in the training
 timer; the isolated replay diagnostic does not remove that cost from a run.
+`pf_forward_seconds_including_compile` measures sampling, discriminator work and
+suffix replay forward, not the inseparable joint CE/PF backward. Use complete
+step and run timers to judge total PF overhead.
 The two-hour SLURM allocation allows diagnosis/measurement; it does not expand
 the one-hour training budget. Smoke results are explicitly labeled and are not
 benchmark results.
@@ -107,13 +133,14 @@ With Tiger's device batch of 1, PF receives one prefix per rank; the H100 device
 batch supplies four. Account for this difference when interpreting exploratory
 Tiger results.
 
-`PYTHONPATH=. python tests/verify_compiled_pf.py --backend fa2` runs a separate
-full-model CUDA diagnostic on one GPU. It forces the generator gate open and
-checks two compiled BF16 replay backward passes for finite trunk gradients and
-gradient isolation. It does not run the training optimizer or establish memory
-headroom alongside the training graph. The normal 224-step smoke retains the
-paper's accuracy gate and is still required.
-Add `--activation-checkpointing` to the diagnostic to exercise the Tiger setting.
+`PYTHONPATH=. python tests/verify_cached_pf.py --backend fa2 --rollout 32
+--activation-checkpointing` runs a small-model/full-context CUDA diagnostic.
+Add `--full-model` for the actual 1.44B model. It forces the generator gate open,
+checks two compiled BF16 joint CE/PF backward passes, and fails if cached decoding
+keeps compiling new graphs as its context grows. It does not run the optimizer or
+establish distributed training memory. Compare rollout 32 and 128 separately.
+The normal 224-step smoke retains the paper's accuracy gate and is still required.
+`verify_compiled_pf.py` remains a legacy standalone replay diagnostic only.
 
 Run as an `srun` step within an existing authorized allocation. The script uses a
 lock to prevent overlapping experiments from the same checkout. Do not cancel the
