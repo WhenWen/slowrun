@@ -625,8 +625,10 @@ class GPT(nn.Module):
             b = min(cache_batch or B, B)
             training_state = {
                 'prefix_kv': tuple(caches),
-                'real_hidden': x[:b, cache_prefix:].detach(),
-                'next_logits': logits[:b, cache_prefix-1].detach(),
+                # Compact copies must not pin full [B,T,C] / [B,T,V] buffers
+                # throughout sampling and joint backward. Prefix KV stays attached.
+                'real_hidden': x[:b, cache_prefix:].detach().clone(),
+                'next_logits': logits[:b, cache_prefix-1].detach().clone(),
                 'training': self.training,
             }
         lm_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),

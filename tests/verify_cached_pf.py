@@ -95,6 +95,9 @@ def main():
                           'decode_calls': len(graph_counts), 'decode_graph_counts': graph_counts,
                           'peak_allocated_mib': torch.cuda.max_memory_allocated() / 2**20,
                           'first_attention_gradient_norm': first_grad}), flush=True)
+        # Validation references must not keep the previous ~5.4 GiB gradient
+        # bank (or exported prefix buffers) alive during the next iteration.
+        del gradients, state, ce, loss, metrics
         original.zero_grad(set_to_none=True)
     print('CACHED_PF_JOINT_BACKWARD_PASS', flush=True)
 
